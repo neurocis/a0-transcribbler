@@ -1,12 +1,14 @@
 """a0_transcribbler core transcription logic.
 
-Reuses Agent Zero's built-in Whisper STT engine for audio file transcription,
-yt-dlp for YouTube audio extraction, and HTTP HEAD probing for audio URLs.
+Uses Agent Zero's plugin-based Whisper STT implementation for audio file
+transcription, yt-dlp for YouTube audio extraction, and HTTP HEAD probing for
+audio URLs.
 """
 
 import base64
 import os
 import re
+import sys
 import tempfile
 import subprocess
 import urllib.request
@@ -15,8 +17,97 @@ from typing import Optional
 from urllib.parse import urlparse
 import shutil
 
-from helpers import files, settings, whisper as whisper_helper
+# Ensure framework-level helpers resolve from /a0, not this plugin's local
+# helpers/ package, when this module is imported by file path or from the
+# plugin working directory.
+_A0_ROOT = "/a0"
+_PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PLUGIN_PARENT = os.path.dirname(_PLUGIN_ROOT)
+sys.path = [
+    entry for entry in sys.path
+    if entry not in ("", _PLUGIN_ROOT, _PLUGIN_PARENT)
+]
+if _A0_ROOT in sys.path:
+    sys.path.remove(_A0_ROOT)
+sys.path.insert(0, _A0_ROOT)
+
+from helpers import files, plugins, settings
 from helpers.print_style import PrintStyle
+
+try:
+    from plugins._whisper_stt.helpers import runtime as whisper_stt_runtime
+except Exception:  # pragma: no cover - legacy Agent Zero fallback
+    whisper_stt_runtime = None
+
+try:
+    from helpers import whisper as legacy_whisper_helper
+except Exception:  # pragma: no cover - unavailable on plugin-based Agent Zero
+    legacy_whisper_helper = None
+
+
+def _get_whisper_stt_config(model_size: str | None = None) -> dict:
+    """Build config for the plugin-based Whisper STT runtime.
+
+    Agent Zero moved Whisper from ``helpers.whisper`` into the built-in
+    ``_whisper_stt`` plugin. Its runtime accepts a config dict instead of the
+    old positional model-size argument. Prefer the plugin config when present,
+    but preserve the legacy ``stt_model_size`` setting as a compatibility
+    fallback for older installations/configurations.
+    """
+    config = {}
+    try:
+        config = plugins.get_plugin_config("_whisper_stt") or {}
+    except Exception:
+        config = {}
+
+    if not isinstance(config, dict):
+        config = {}
+
+    if model_size and not config.get("model_size"):
+        config["model_size"] = model_size
+
+    if not config.get("model_size"):
+        config["model_size"] = "base"
+
+    return config
+
+
+async def _transcribe_with_whisper_stt(audio_bytes_b64: str) -> dict:
+    """Transcribe base64 audio via plugin-based Whisper STT, with legacy fallback."""
+    stt_settings = settings.get_settings()
+    model_size = stt_settings.get("stt_model_size", "base")
+
+    if whisper_stt_runtime is not None:
+        if hasattr(whisper_stt_runtime, "is_globally_enabled"):
+            try:
+                if not whisper_stt_runtime.is_globally_enabled():
+                    PrintStyle.warning(
+                        "a0_transcribbler: _whisper_stt plugin is disabled; "
+                        "attempting legacy Whisper fallback"
+                    )
+                else:
+                    return await whisper_stt_runtime.transcribe(
+                        audio_bytes_b64,
+                        _get_whisper_stt_config(str(model_size)),
+                    )
+            except Exception as e:
+                PrintStyle.warning(
+                    f"a0_transcribbler: _whisper_stt transcription failed: {e}; "
+                    "attempting legacy Whisper fallback"
+                )
+        else:
+            return await whisper_stt_runtime.transcribe(
+                audio_bytes_b64,
+                _get_whisper_stt_config(str(model_size)),
+            )
+
+    if legacy_whisper_helper is not None:
+        return await legacy_whisper_helper.transcribe(model_size, audio_bytes_b64)
+
+    raise RuntimeError(
+        "No Whisper STT backend available. Enable/install Agent Zero plugin "
+        "'_whisper_stt' or provide legacy helpers.whisper."
+    )
 
 
 def _resolve_yt_dlp_path() -> str:
@@ -238,12 +329,9 @@ async def transcribe_audio_url(
         with open(wav_path, "rb") as f:
             audio_bytes_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        # Transcribe using Whisper
-        stt_settings = settings.get_settings()
-        model_size = stt_settings.get("stt_model_size", "base")
-
+        # Transcribe using plugin-based Whisper STT
         PrintStyle.info(f"a0_transcribbler: transcribing audio from {url}...")
-        transcription_result = await whisper_helper.transcribe(model_size, audio_bytes_b64)
+        transcription_result = await _transcribe_with_whisper_stt(audio_bytes_b64)
 
         if transcription_result and "text" in transcription_result:
             text = transcription_result["text"].strip()
@@ -274,7 +362,7 @@ async def transcribe_audio_url(
             pass
 
 async def transcribe_audio_file(filepath: str) -> Optional[str]:
-    """Transcribe an audio file using Agent Zero's Whisper STT.
+    """Transcribe an audio file using Agent Zero's plugin-based Whisper STT.
 
     Converts the file to WAV first (via ffmpeg) for maximum compatibility,
     then passes base64-encoded bytes to the Whisper helper.
@@ -315,13 +403,9 @@ async def transcribe_audio_file(filepath: str) -> Optional[str]:
             except OSError:
                 pass
 
-        # Get STT model size from settings
-        stt_settings = settings.get_settings()
-        model_size = stt_settings.get("stt_model_size", "base")
-
-        # Transcribe using Whisper
+        # Transcribe using plugin-based Whisper STT
         PrintStyle.info(f"a0_transcribbler: transcribing {os.path.basename(filepath)}...")
-        transcription_result = await whisper_helper.transcribe(model_size, audio_bytes_b64)
+        transcription_result = await _transcribe_with_whisper_stt(audio_bytes_b64)
 
         if transcription_result and "text" in transcription_result:
             text = transcription_result["text"].strip()
@@ -564,12 +648,9 @@ async def transcribe_youtube_url(
         with open(final_path, "rb") as f:
             audio_bytes_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        # Transcribe
-        stt_settings = settings.get_settings()
-        model_size = stt_settings.get("stt_model_size", "base")
-
+        # Transcribe using plugin-based Whisper STT
         PrintStyle.info(f"a0_transcribbler: transcribing YouTube audio from {url}...")
-        transcription_result = await whisper_helper.transcribe(model_size, audio_bytes_b64)
+        transcription_result = await _transcribe_with_whisper_stt(audio_bytes_b64)
 
         if transcription_result and "text" in transcription_result:
             text = transcription_result["text"].strip()
